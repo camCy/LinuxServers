@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Taller de comandos Linux - Modo "yo tecleo" (versión limpia)
+# Taller de comandos Linux - Modo "yo tecleo" (versión limpia + Enter silencioso)
 # Ejecutar: sudo ./taller_linux_guiado_clean.sh
 set -euo pipefail
 
@@ -14,7 +14,7 @@ REAL_USER="${SUDO_USER:-$USER}"
 HOSTNAME_SHOW="$(hostname -s || echo debian)"
 PROMPT_COLOR="\e[1;32m"
 RESET_COLOR="\e[0m"
-TYPE_SPEED="${TYPE_SPEED:-0.01}"  # 0.005-0.02
+TYPE_SPEED="${TYPE_SPEED:-0.01}"  # 0.005-0.02 recomendado
 
 # === Helpers de GUIA ===
 typewrite() {
@@ -28,17 +28,20 @@ typewrite() {
 
 show_prompt_and_cmd() {
   local cmd="$1"
+  clear  # limpia pantalla para capturas limpias
   printf "${PROMPT_COLOR}%s@%s${RESET_COLOR}:%s$ " "$REAL_USER" "$HOSTNAME_SHOW" "~"
   typewrite "$cmd"
   printf "\n"
 }
 
+# Muestra y ejecuta el mismo comando (espera a Enter SIN mensaje)
 RUN() {
-  # Muestra y ejecuta el mismo comando
   local cmd="$1"
   local log="${2:-}"
   show_prompt_and_cmd "$cmd"
-  read -rp "➡️  (Enter) para ejecutar…"
+  # Espera silenciosa a Enter (no imprime texto)
+  read -rs
+
   set +e
   if [[ -n "$log" ]]; then
     bash -lc "$cmd" 2>&1 | tee -a "$LOGDIR/$log"
@@ -51,13 +54,16 @@ RUN() {
   return $rc
 }
 
-# Muestra un comando "bonito" pero ejecuta otro real (oculto)
+# Muestra un comando “bonito” pero ejecuta otro real (oculto). Espera a Enter sin mensaje.
 RUN_CLEAN() {
   local display_cmd="$1"   # lo que se muestra
-  local exec_cmd="$2"      # lo que se ejecuta
-  local log="${3:-}"       # log opcional
+  local exec_cmd="$2"      # lo que se ejecuta realmente
+  local log="${3:-}"
+
   show_prompt_and_cmd "$display_cmd"
-  read -rp "➡️  (Enter) para ejecutar…"
+  # Espera silenciosa a Enter (no imprime texto)
+  read -rs
+
   set +e
   if [[ -n "$log" ]]; then
     bash -lc "$exec_cmd" 2>&1 | tee -a "$LOGDIR/$log"
@@ -216,4 +222,4 @@ RUN "kill \$(cat /tmp/control_pid) || true" "DF_control.txt"
 RUN "ls -l /proyecto && tail -n +1 -v /proyecto/usuarios_conectados.log 2>/dev/null || true" "DF_control.txt"
 
 echo -e "\n✅ Listo. Evidencias en: $LOGDIR"
-NOTE "Para grabar toda la sesión en un transcript:\n  script -a ~/taller_linux_transcript.txt -c 'sudo ./taller_linux_guiado_clean.sh'"
+NOTE "Si quieres transcript completo de la sesión:\n  script -a ~/taller_linux_transcript.txt -c 'sudo ./taller_linux_guiado_clean.sh'"
