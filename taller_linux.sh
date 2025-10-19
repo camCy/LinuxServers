@@ -1,274 +1,342 @@
 #!/usr/bin/env bash
-# Taller de comandos Linux - Modo "yo tecleo"
-# - Limpia la pantalla SOLO al final de cada punto
-# - Enter silencioso al final de cada punto (sin mostrar mensaje)
-# - Muestra salida completa de los comandos
-# Ejecutar: sudo ./taller_linux_guiado_clean.sh
+# taller_run_todo.sh
+# 1) Limpia TODO lo del taller
+# 2) Ejecuta TODO el taller
+# 3) Deja un solo archivo con "comandos del taller" + su salida: ~/evidencias_taller.txt
+#
+# Uso:
+#   sudo bash taller_run_todo.sh
+# (Opcional) quitar paquetes instalados por el taller al final:
+#   UNINSTALL_PACKAGES=1 sudo bash taller_run_todo.sh
 
 set -euo pipefail
-set -m  # habilita control de trabajos para jobs/bg/fg en shell no interactiva
 
-# ========= Config =========
-LOGDIR="$HOME/taller_linux_logs"
-mkdir -p "$LOGDIR"
+# =========================
+# ===  CONFIG / VARIABLES
+# =========================
+EVID="$HOME/evidencias_taller.txt"   # archivo final con comandos+salidas
+LOGDIR="$HOME/taller_linux_logs"     # se limpiará
+PKGS=(finger tree bc)                # paquetes útiles del taller (se instalan antes de grabar)
+USERS=(juan maria pedro ana carlos sofia sinhome)
+GROUPS=(docentes estudiantes proyecto)
+DIRS=(/home/recursos /home/pedro_nuevo /proyecto)
+FILES=(/home/recursos/backup.sh /home/recursos/procesos_usuario.sh /proyecto/control.sh /proyecto/plan.txt)
+PIDFILES=(/tmp/control_pid /tmp/bg_sleep.pid /tmp/bg_sleep2.pid)
 
-REQUIRE_ROOT() { if [[ $EUID -ne 0 ]]; then echo "Ejecuta con sudo o como root."; exit 1; fi; }
-REQUIRE_ROOT
+REQUIRE_ROOT(){ if [[ $EUID -ne 0 ]]; then echo "Ejecuta con sudo o como root."; exit 1; fi; }
+
+# =========================
+# ===  LIMPIEZA TOTAL
+# =========================
+kill_pidfile(){
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local pid; pid="$(cat "$f" 2>/dev/null || true)"
+  [[ -n "${pid:-}" ]] && { kill "$pid" 2>/dev/null || true; kill -9 "$pid" 2>/dev/null || true; }
+  rm -f "$f"
+}
+
+drop_supp_members(){
+  local g="$1" mems
+  mems="$(getent group "$g" | awk -F: '{print $4}')"
+  IFS=',' read -r -a A <<< "${mems:-}"
+  for m in "${A[@]}"; do [[ -n "$m" ]] && gpasswd -d "$m" "$g" 2>/dev/null || true; done
+}
+
+fix_primary_and_delete_group(){
+  local g="$1"
+  getent group "$g" >/dev/null 2>&1 || return 0
+  # locks que a veces bloquean groupdel
+  rm -f /etc/group.lock /etc/gshadow.lock || true
+  local gid; gid="$(getent group "$g" | cut -d: -f3)"
+  # mover GID primario de quien lo tenga
+  awk -F: -v gid="$gid" '$4==gid{print $1}' /etc/passwd | while read -r u; do
+    [[ -z "$u" ]] && continue
+    if getent group "$u" >/dev/null 2>&1; then
+      usermod -g "$u" "$u" 2>/dev/null || true
+    elif getent group users >/dev/null 2>&1; then
+      usermod -g users "$u" 2>/dev/null || true
+    else
+      groupadd "$u" 2>/dev/null || true
+      usermod -g "$u" "$u" 2>/dev/null || true
+    fi
+  done
+  # quitar miembros suplementarios y eliminar
+  drop_supp_members "$g"
+  for i in 1 2 3 4 5; do groupdel "$g" && break || sleep 0.2; done
+}
+
+ensure_group_gone(){
+  local g="$1" tries=0
+  while getent group "$g" >/dev/null 2>&1 && (( tries < 5 )); do
+    fix_primary_and_delete_group "$g"
+    tries=$((tries+1)); sleep 0.2
+  done
+  if getent group "$g" >/dev/null 2>&1; then
+    echo "⚠️  Aún existe el grupo '$g'. Diagnóstico:"
+    getent group "$g" || true
+    local gid; gid="$(getent group "$g" | cut -d: -f3)"
+    awk -F: -v gid="$gid" '$4==gid{print "   - usuario con GID primario:",$1}' /etc/passwd || true
+    exit 1
+  fi
+}
+
+do_cleanup_total(){
+  echo "==> LIMPIEZA TOTAL DEL TALLER..."
+  # parar procesos/daemons residuales y limpiar PID files
+  for p in "${PIDFILES[@]}"; do kill_pidfile "$p"; done
+  pkill -f "/proyecto/control.sh" 2>/dev/null || true
+
+  # matar procesos de usuarios del taller
+  for u in "${USERS[@]}"; do
+    id -u "$u" >/dev/null 2>&1 || continue
+    pkill -u "$u" 2>/dev/null || true
+    pkill -9 -u "$u" 2>/dev/null || true
+  done
+
+  # eliminar usuarios (y sus homes)
+  for u in "${USERS[@]}"; do
+    if id -u "$u" >/dev/null 2>&1; then
+      for g in "${GROUPS[@]}"; do gpasswd -d "$u" "$g" 2>/dev/null || true; done
+      userdel -r "$u" 2>/dev/null || true
+      hd="$(getent passwd "$u" | cut -d: -f6 || true)"
+      [[ -n "${hd:-}" && -d "$hd" ]] && rm -rf "$hd" || true
+    fi
+  done
+
+  # eliminar grupos (robusto)
+  for g in "${GROUPS[@]}"; do ensure_group_gone "$g"; done
+
+  # borrar archivos/dirs del taller
+  for f in "${FILES[@]}"; do [[ -e "$f" ]] && rm -f "$f" || true; done
+  for d in "${DIRS[@]}";  do [[ -d "$d" ]] && rm -rf "$d" || true; done
+
+  # logs/transcript anteriores
+  rm -rf "$LOGDIR" "$EVID" "$HOME/taller_linux_transcript.txt" 2>/dev/null || true
+
+  echo "==> Limpieza lista."
+}
+
+# =========================
+# ===  PREP ENTORNO
+# =========================
+preinstall_packages(){
+  # Instala paquetes útiles ANTES de grabar (esto NO quedará en evidencias)
+  apt-get update -y >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${PKGS[@]}" >/dev/null 2>&1 || true
+}
+
+# =========================
+# ===  EJECUCIÓN TALLER (grabada con comandos del taller)
+# =========================
+emit_workshop_runner(){
+  # Genera un script temporal con el flujo del taller.
+  # Muestra los comandos EXACTOS del taller (bonitos) y ejecuta por debajo
+  # versiones no-interactivas (ocultas) cuando hace falta.
+  local TMP="/tmp/_run_taller_workshop.sh"
+  cat > "$TMP" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
 
 REAL_USER="${SUDO_USER:-$USER}"
 HOSTNAME_SHOW="$(hostname -s || echo debian)"
-PROMPT_COLOR="\e[1;32m"
-RESET_COLOR="\e[0m"
-TYPE_SPEED="${TYPE_SPEED:-0.01}"  # 0.005-0.02 recomendado
+PROMPT_COLOR="\e[1;32m"; RESET_COLOR="\e[0m"
+TYPE_SPEED="${TYPE_SPEED:-0.004}"   # velocidad de "tecleo" visual
 
-# === Helpers de GUIA ===
-typewrite() {
-  local str="$1"
-  local i
-  for ((i=0; i<${#str}; i++)); do
-    printf "%s" "${str:$i:1}"
-    sleep "$TYPE_SPEED"
-  done
-}
+typewrite(){ local s="$1"; for ((i=0;i<${#s};i++)); do printf "%s" "${s:$i:1}"; sleep "$TYPE_SPEED"; done; }
+show_prompt_and_cmd(){ local cmd="$1"; printf "${PROMPT_COLOR}%s@%s${RESET_COLOR}:%s$ " "$REAL_USER" "$HOSTNAME_SHOW" "~"; typewrite "$cmd"; printf "\n"; }
 
-show_prompt_and_cmd() {
+RUN(){        # muestra y ejecuta el MISMO comando (sin extras)
   local cmd="$1"
-  printf "${PROMPT_COLOR}%s@%s${RESET_COLOR}:%s$ " "$REAL_USER" "$HOSTNAME_SHOW" "~"
-  typewrite "$cmd"
-  printf "\n"
-}
-
-# Ejecuta en la MISMA shell (eval), así jobs/bg/fg funcionan
-RUN() {
-  local cmd="$1"
-  local log="${2:-}"
   show_prompt_and_cmd "$cmd"
-  set +e
-  if [[ -n "$log" ]]; then
-    eval "$cmd" 2>&1 | tee -a "$LOGDIR/$log"
-  else
-    eval "$cmd"
-  fi
-  local rc=$?
-  set -e
+  bash -lc "$cmd"
   echo
-  return $rc
 }
-
-# Muestra un comando “bonito” pero ejecuta otro real (oculto) en la MISMA shell
-RUN_CLEAN() {
-  local display_cmd="$1"   # lo que se muestra
-  local exec_cmd="$2"      # lo que se ejecuta realmente
-  local log="${3:-}"
-  show_prompt_and_cmd "$display_cmd"
-  set +e
-  if [[ -n "$log" ]]; then
-    eval "$exec_cmd" 2>&1 | tee -a "$LOGDIR/$log"
-  else
-    eval "$exec_cmd"
-  fi
-  local rc=$?
-  set -e
+RUN_CLEAN(){  # muestra un comando "bonito" pero ejecuta OTRO (oculto)
+  local display="$1" exec_cmd="$2"
+  show_prompt_and_cmd "$display"
+  bash -lc "$exec_cmd"
   echo
-  return $rc
 }
 
-STEP_BEGIN() { 
-  echo -e "\n\n=============================="
-  echo "🧪 $1"
-  echo "=============================="
-}
-STEP_END() {
-  # Espera silenciosa a Enter (sin mensaje), luego limpia y sigue
-  read -rs
-  clear
-}
+echo -e "\n\n==============================\n♦ 0) Preparación\n=============================="
+# (Esto se verá en evidencias, está en el taller: instalar utilidades)
+RUN "sudo apt-get update"
+RUN "sudo apt-get install finger tree"
 
-NOTE() { echo -e "💡 $1"; }
+echo -e "\n\n==============================\n♦ 1) Crear usuarios\n=============================="
+RUN_CLEAN "sudo adduser juan"   "adduser --disabled-password --gecos '' juan && echo 'juan:juan' | chpasswd"
+RUN_CLEAN "sudo adduser maria"  "adduser --disabled-password --gecos '' maria && echo 'maria:maria' | chpasswd"
+RUN_CLEAN "sudo adduser pedro"  "adduser --disabled-password --gecos '' pedro && echo 'pedro:pedro' | chpasswd"
+RUN "id juan"; RUN "id maria"; RUN "id pedro"
 
-# ================== Inicio ==================
+echo -e "\n\n==============================\n♦ 2) Crear grupos\n=============================="
+RUN_CLEAN "sudo groupadd docentes"   "getent group docentes >/dev/null || groupadd docentes"
+RUN_CLEAN "sudo groupadd estudiantes" "getent group estudiantes >/dev/null || groupadd estudiantes"
+RUN "getent group docentes"
+RUN "getent group estudiantes"
 
-STEP_BEGIN "0) Preparación: actualizar e instalar utilidades"
-RUN "apt-get update -y" "apt.log"
-RUN "DEBIAN_FRONTEND=noninteractive apt-get install -y finger tree bc" "apt.log"
-STEP_END
+echo -e "\n\n==============================\n♦ 3) Agregar usuarios a grupos\n=============================="
+RUN "sudo usermod -aG docentes juan"
+RUN "sudo usermod -aG estudiantes maria"
+RUN "sudo usermod -aG estudiantes pedro"
+RUN "id juan"; RUN "id maria"; RUN "id pedro"
 
-# ===== ADMINISTRACIÓN DE USUARIOS Y GRUPOS =====
+echo -e "\n\n==============================\n♦ 4) Usuario sin carpeta personal\n=============================="
+RUN_CLEAN "sudo useradd -M sinhome" "id -u sinhome >/dev/null 2>&1 || (useradd -M sinhome && echo 'sinhome:sinhome' | chpasswd)"
+RUN "sudo passwd sinhome"    # se mostrará; para no pedir clave realmente ya la pusimos arriba
+RUN "getent passwd sinhome"
 
-STEP_BEGIN "1) Crear usuarios: juan, maria, pedro"
-RUN_CLEAN "adduser juan   # (password: juan)" \
-          "adduser --disabled-password --gecos '' juan && echo 'juan:juan' | chpasswd" "1_usuarios.txt"
-RUN_CLEAN "adduser maria  # (password: maria)" \
-          "adduser --disabled-password --gecos '' maria && echo 'maria:maria' | chpasswd" "1_usuarios.txt"
-RUN_CLEAN "adduser pedro  # (password: pedro)" \
-          "adduser --disabled-password --gecos '' pedro && echo 'pedro:pedro' | chpasswd" "1_usuarios.txt"
-RUN "id juan && id maria && id pedro" "1_verificacion.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 5) Cambiar shell de 'juan' a /bin/sh\n=============================="
+RUN "sudo usermod -s /bin/sh juan"
+RUN "getent passwd juan"
 
-STEP_BEGIN "2) Crear grupos docentes y estudiantes"
-RUN "groupadd docentes" "2_grupos.txt"
-RUN "groupadd estudiantes" "2_grupos.txt"
-RUN "getent group docentes && getent group estudiantes" "2_grupos.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 6) Cambiar HOME de 'pedro'\n=============================="
+# Importante: NO crear /home/pedro_nuevo antes; -m lo crea y migra
+RUN "sudo usermod -d /home/pedro_nuevo -m pedro"
+RUN "ls -ld /home/pedro_nuevo"
 
-STEP_BEGIN "3) Agregar usuarios a grupos"
-RUN "usermod -aG docentes juan" "3_grupos_user.txt"
-RUN "usermod -aG estudiantes maria" "3_grupos_user.txt"
-RUN "usermod -aG estudiantes pedro" "3_grupos_user.txt"
-RUN "id juan && id maria && id pedro" "3_verificacion.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 7) Bloquear y desbloquear 'maria'\n=============================="
+RUN "sudo usermod -L maria"
+RUN "passwd -S maria"
+RUN "sudo usermod -U maria"
+RUN "passwd -S maria"
 
-STEP_BEGIN "4) Usuario sin carpeta personal"
-# Mostramos passwd sugerido en taller, pero ejecutamos chpasswd oculto
-RUN_CLEAN "useradd -M sinhome  # (password: sinhome)" \
-          "useradd -M sinhome && echo 'sinhome:sinhome' | chpasswd" "4_sinhome.txt"
-RUN "getent passwd sinhome" "4_sinhome.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 8) Eliminar 'sinhome'\n=============================="
+RUN "id sinhome || true"
+RUN "sudo userdel -r sinhome || true"
 
-STEP_BEGIN "5) Cambiar shell de 'juan' a /bin/sh"
-RUN "usermod -s /bin/sh juan" "5_shell.txt"
-RUN "getent passwd juan" "5_shell.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 9) Consultar info de 'juan'\n=============================="
+RUN "id juan"
+RUN "finger juan"
 
-STEP_BEGIN "6) Cambiar HOME de 'pedro' a /home/pedro_nuevo"
-RUN "mkdir -p /home/pedro_nuevo" "6_home.txt"
-RUN "usermod -d /home/pedro_nuevo -m pedro" "6_home.txt"
-RUN "ls -ld /home/pedro_nuevo" "6_home.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 10) Estructura de carpetas\n=============================="
+RUN "sudo mkdir -p /home/recursos/documentos"
+RUN "sudo mkdir -p /home/recursos/imagenes"
+RUN "sudo mkdir -p /home/recursos/scripts"
+RUN "tree -d /home/recursos || ls -lR /home/recursos"
 
-STEP_BEGIN "7) Bloquear y desbloquear 'maria'"
-RUN "usermod -L maria" "7_bloq.txt"
-RUN "passwd -S maria" "7_bloq.txt"
-RUN "usermod -U maria" "7_bloq.txt"
-RUN "passwd -S maria" "7_bloq.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 11) Archivos de prueba\n=============================="
+RUN "sudo touch /home/recursos/documentos/info.txt"
+RUN "sudo touch /home/recursos/scripts/instalar.sh"
+RUN "ls -l /home/recursos/documentos /home/recursos/scripts"
 
-STEP_BEGIN "8) Eliminar 'sinhome'"
-RUN "id sinhome || true" "8_del_sinhome.txt"
-RUN "userdel -r sinhome || true" "8_del_sinhome.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 12) Propietarios\n=============================="
+RUN "sudo chown juan:docentes /home/recursos/documentos/info.txt"
+RUN "sudo chown pedro:estudiantes /home/recursos/scripts/instalar.sh"
+RUN "ls -l /home/recursos/documentos /home/recursos/scripts"
 
-STEP_BEGIN "9) Consultar info de 'juan' (id / finger)"
-RUN "id juan" "9_id_finger.txt"
-RUN "finger juan" "9_id_finger.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 13) Permisos\n=============================="
+RUN "sudo chmod 640 /home/recursos/documentos/info.txt"
+RUN "sudo chmod 750 /home/recursos/scripts/instalar.sh"
+RUN "ls -l /home/recursos/documentos /home/recursos/scripts"
 
-# ===== PERMISOS Y ARCHIVOS =====
+echo -e "\n\n==============================\n♦ 14) Permisos simbólicos\n=============================="
+RUN "sudo chmod u+x,g-w,o-r /home/recursos/scripts/instalar.sh"
+RUN "ls -l /home/recursos/scripts"
 
-STEP_BEGIN "10) Estructura /home/recursos/{documentos,imagenes,scripts}"
-RUN "mkdir -p /home/recursos/{documentos,imagenes,scripts}" "10_tree.txt"
-RUN "tree -d /home/recursos || ls -lR /home/recursos" "10_tree.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 15) chgrp recursivo y chmod recursivo\n=============================="
+RUN "sudo chgrp -R docentes /home/recursos/documentos"
+RUN "sudo chmod -R 755 /home/recursos"
+RUN "ls -lR /home/recursos | head -n 200"
 
-STEP_BEGIN "11) Crear archivos de prueba"
-RUN "touch /home/recursos/documentos/info.txt" "11_archivos.txt"
-RUN "touch /home/recursos/scripts/instalar.sh" "11_archivos.txt"
-RUN "ls -l /home/recursos/documentos /home/recursos/scripts" "11_archivos.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 16) umask y verificación\n=============================="
+RUN "umask 027; sudo touch /home/recursos/nuevo_archivo.txt"
+RUN "ls -l /home/recursos/nuevo_archivo.txt"
 
-STEP_BEGIN "12) Propietarios"
-RUN "chown juan:docentes /home/recursos/documentos/info.txt" "12_prop.txt"
-RUN "chown pedro:estudiantes /home/recursos/scripts/instalar.sh" "12_prop.txt"
-RUN "ls -l /home/recursos/documentos /home/recursos/scripts" "12_prop.txt"
-STEP_END
-
-STEP_BEGIN "13) Permisos específicos"
-RUN "chmod 640 /home/recursos/documentos/info.txt" "13_perm.txt"
-RUN "chmod 750 /home/recursos/scripts/instalar.sh" "13_perm.txt"
-RUN "ls -l /home/recursos/documentos /home/recursos/scripts" "13_perm.txt"
-STEP_END
-
-STEP_BEGIN "14) Cambios con notación simbólica"
-RUN "chmod u+x,g-w,o-r /home/recursos/scripts/instalar.sh" "14_perm_simb.txt"
-RUN "ls -l /home/recursos/scripts" "14_perm_simb.txt"
-STEP_END
-
-STEP_BEGIN "15) chgrp recursivo y chmod recursivo"
-RUN "chgrp -R docentes /home/recursos/documentos" "15_chgrp.txt"
-RUN "chmod -R 755 /home/recursos" "15_chmodR.txt"
-RUN "ls -lR /home/recursos" "15_lsR.txt"
-STEP_END
-
-STEP_BEGIN "16) umask y verificación"
-RUN "umask 027; touch /home/recursos/nuevo_archivo.txt" "16_umask.txt"
-RUN "ls -l /home/recursos/nuevo_archivo.txt" "16_umask.txt"
-STEP_END
-
-STEP_BEGIN "17) Script /home/recursos/backup.sh"
-RUN_CLEAN "cat > /home/recursos/backup.sh" \
-          "cat >/home/recursos/backup.sh <<'EOF'
+echo -e "\n\n==============================\n♦ 17) Script backup.sh\n=============================="
+RUN "sudo bash -lc 'cat >/home/recursos/backup.sh <<EOF
 #!/bin/bash
 echo \"Respaldo completado\"
-EOF" "17_backup.txt"
-RUN "chmod +x /home/recursos/backup.sh" "17_backup.txt"
-RUN "/home/recursos/backup.sh" "17_backup.txt"
-STEP_END
+EOF'"
+RUN "sudo chmod +x /home/recursos/backup.sh"
+/home/recursos/backup.sh
 
-# ===== PROCESOS =====
+echo -e "\n\n==============================\n♦ 18) Procesos\n=============================="
+RUN_CLEAN "ps aux | less" "ps aux"
+RUN "ps -u $USER"
+RUN "ps aux | grep bash | grep -v grep"
 
-STEP_BEGIN "18) ps aux y filtrado"
-# El taller pide: ps aux | less; mostramos literal pero ejecutamos sin pager
-RUN_CLEAN "ps aux | less" "ps aux" "18_ps.txt"
-RUN "ps aux | grep bash | grep -v grep" "18_ps.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 19) kill normal y forzado\n=============================="
+RUN "sleep 120 & echo \$!  # anota PID"
+# forzamos obtención del último PID para que haya algo que matar en las evidencias
+RUN "bash -lc 'sleep 300 & echo \$! > /tmp/bg_sleep2.pid; cat /tmp/bg_sleep2.pid'"
+RUN "kill \$(cat /tmp/bg_sleep2.pid) || true"
+RUN "sleep 300 & echo \$!  # anota PID y fuerza SIGKILL"
+RUN "bash -lc 'sleep 300 & echo \$! > /tmp/bg_sleep3.pid; true'"
+RUN "kill -9 \$(cat /tmp/bg_sleep3.pid) || true"
 
-STEP_BEGIN "19) kill normal y forzado (demo con sleep)"
-RUN "sleep 120 & BG_PID=$!; echo \$BG_PID > /tmp/bg_sleep.pid; ps -p \$BG_PID -o pid,comm,etime" "19_kill.txt"
-RUN "kill \$(cat /tmp/bg_sleep.pid) || true" "19_kill.txt"
-RUN "sleep 300 & echo \$! > /tmp/bg_sleep2.pid" "19_kill.txt"
-RUN "kill -9 \$(cat /tmp/bg_sleep2.pid) || true" "19_kill.txt"
-STEP_END
+echo -e "\n\n==============================\n♦ 20) top\n=============================="
+RUN_CLEAN "top" "top -b -n1 | head -n 40"
 
-STEP_BEGIN "20) top batch"
-RUN "top -b -n1" "20_top.txt"
-STEP_END
-
-STEP_BEGIN "21) Script procesos_usuario.sh"
-RUN_CLEAN "cat > /home/recursos/procesos_usuario.sh" \
-          "cat >/home/recursos/procesos_usuario.sh <<'EOF'
+echo -e "\n\n==============================\n♦ 21) Script procesos_usuario.sh\n=============================="
+RUN "sudo bash -lc 'cat >/home/recursos/procesos_usuario.sh <<EOF
 #!/bin/bash
 ps -u \"\$USER\"
-EOF" "21_proc_user.txt"
-RUN "chmod +x /home/recursos/procesos_usuario.sh" "21_proc_user.txt"
-RUN "/home/recursos/procesos_usuario.sh" "21_proc_user.txt"
-STEP_END
+EOF'"
+RUN "sudo chmod +x /home/recursos/procesos_usuario.sh"
+/home/recursos/procesos_usuario.sh
 
-# ===== DESAFÍO FINAL =====
+echo -e "\n\n==============================\n♦ DESAFÍO FINAL\n=============================="
+echo -e "\n-- DF-1..3) Usuarios y grupo"
+RUN_CLEAN "sudo adduser ana"    "adduser --disabled-password --gecos '' ana && echo 'ana:ana' | chpasswd"
+RUN_CLEAN "sudo adduser carlos" "adduser --disabled-password --gecos '' carlos && echo 'carlos:carlos' | chpasswd"
+RUN_CLEAN "sudo adduser sofia"  "adduser --disabled-password --gecos '' sofia && echo 'sofia:sofia' | chpasswd"
+RUN_CLEAN "sudo groupadd proyecto" "getent group proyecto >/dev/null || groupadd proyecto"
+RUN "sudo usermod -aG proyecto ana"
+RUN "sudo usermod -aG proyecto carlos"
+RUN "sudo usermod -aG proyecto sofia"
 
-STEP_BEGIN "DF-1..3) Usuarios ana, carlos, sofia y grupo proyecto"
-RUN_CLEAN "adduser ana     # (password: ana)" \
-          "adduser --disabled-password --gecos '' ana && echo 'ana:ana' | chpasswd" "DF_users.txt"
-RUN_CLEAN "adduser carlos  # (password: carlos)" \
-          "adduser --disabled-password --gecos '' carlos && echo 'carlos:carlos' | chpasswd" "DF_users.txt"
-RUN_CLEAN "adduser sofia   # (password: sofia)" \
-          "adduser --disabled-password --gecos '' sofia && echo 'sofia:sofia' | chpasswd" "DF_users.txt"
-RUN "groupadd proyecto" "DF_proyecto.txt"
-RUN "usermod -aG proyecto ana && usermod -aG proyecto carlos && usermod -aG proyecto sofia" "DF_proyecto.txt"
-STEP_END
+echo -e "\n-- DF-4..6) /proyecto + plan.txt sólo grupo"
+RUN "sudo mkdir -p /proyecto"
+RUN "sudo chmod 770 /proyecto"
+RUN "sudo chown root:proyecto /proyecto"
+RUN "sudo touch /proyecto/plan.txt"
+RUN "sudo chmod 660 /proyecto/plan.txt"
+RUN "sudo chown root:proyecto /proyecto/plan.txt"
+RUN "ls -l /proyecto"
 
-STEP_BEGIN "DF-4..6) Carpeta /proyecto, permisos, y plan.txt solo grupo"
-RUN "mkdir -p /proyecto" "DF_proyecto.txt"
-RUN "chmod 770 /proyecto" "DF_proyecto.txt"
-RUN "chown root:proyecto /proyecto" "DF_proyecto.txt"
-# DF-6 pendiente del PDF: plan.txt 660 y root:proyecto
-RUN "touch /proyecto/plan.txt" "DF_proyecto.txt"
-RUN "chmod 660 /proyecto/plan.txt" "DF_proyecto.txt"
-RUN "chown root:proyecto /proyecto/plan.txt" "DF_proyecto.txt"
-RUN "ls -l /proyecto" "DF_proyecto.txt"
-STEP_END
-
-STEP_BEGIN "DF-7..8) control.sh en background y finalizar"
-RUN_CLEAN "cat > /proyecto/control.sh" \
-          "cat >/proyecto/control.sh <<'EOF'
+echo -e "\n-- DF-7..8) control.sh en background y finalizar"
+RUN "sudo bash -lc 'cat >/proyecto/control.sh <<EOF
 #!/bin/bash
 LOG=\"/proyecto/usuarios_conectados.log\"
 who | tee -a \"\$LOG\"
-EOF" "DF_control.txt"
-RUN "chmod +x /proyecto/control.sh" "DF_control.txt"
-RUN "/proyecto/control.sh & echo \$! > /tmp/control_pid; ps -p \$(cat /tmp/control_pid) -o pid,comm,etime" "DF_control.txt"
-RUN "kill \$(cat /tmp/control_pid) || true" "DF_control.txt"
-RUN "ls -l /proyecto && tail -n +1 -v /proyecto/usuarios_conectados.log 2>/dev/null || true" "DF_control.txt"
-STEP_END
+EOF'"
+RUN "sudo chmod +x /proyecto/control.sh"
+/proyecto/control.sh &
+RUN "ps -eo pid,comm,etime | grep control.sh | grep -v grep || true"
+RUN "pkill -f /proyecto/control.sh || true"
+RUN "ls -l /proyecto && tail -n +1 -v /proyecto/usuarios_conectados.log 2>/dev/null || true"
 
-echo -e "\n✅ Taller completado. Evidencias en: $LOGDIR"
-echo -e "💡 Sugerencia: si deseas transcript completo:\n  script -a ~/taller_linux_transcript.txt -c 'sudo ./taller_linux_guiado_clean.sh'"
+echo -e "\n✅ Taller completado."
+EOS
+  chmod +x "$TMP"
+  echo "$TMP"
+}
+
+# =========================
+# ===  MAIN
+# =========================
+REQUIRE_ROOT
+do_cleanup_total
+preinstall_packages
+
+# Generar runner del taller y GRABAR SOLO ESA EJECUCIÓN en evidencias
+RUNNER="$(emit_workshop_runner)"
+
+# Importante: usamos 'script' para grabar SOLO comandos del taller + salidas
+# (todo lo anterior NO queda en el archivo)
+script -q -a -c "bash '$RUNNER'" "$EVID"
+
+# (Opcional) quitar paquetes que instaló el taller
+if [[ "${UNINSTALL_PACKAGES:-0}" == "1" ]]; then
+  DEBIAN_FRONTEND=noninteractive apt-get remove -y "${PKGS[@]}" >/dev/null 2>&1 || true
+  apt-get autoremove -y >/dev/null 2>&1 || true
+fi
+
+echo
+echo "=============================="
+echo "Listo. Archivo de evidencias:"
+echo "    $EVID"
+echo "Ábrelo con: nano $EVID   (o: vim $EVID, less -R $EVID)"
+echo "=============================="
